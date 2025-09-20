@@ -7,9 +7,11 @@ import time
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from datetime import datetime
 
 # 환경변수 불러오기
 load_dotenv()
+
 
 class OKXTrader:
     def __init__(self):
@@ -17,7 +19,7 @@ class OKXTrader:
         self.secret_key = os.getenv("OKX_API_SECRET")
         self.passphrase = os.getenv("OKX_API_PASSPHRASE")
         self.base_url = os.getenv("OKX_BASE_URL", "https://www.okx.com")
-        self.simulated = os.getenv("OKX_SIMULATED", "1")  # 기본값 1=데모
+        self.simulated = os.getenv("OKX_SIMULATED", "1")  # 1 = 데모
         self.td_mode = os.getenv("DEFAULT_TDMODE", "isolated")
         self.market = os.getenv("DEFAULT_MARKET", "swap")
         self.webhook_token = os.getenv("WEBHOOK_TOKEN", "test123")
@@ -69,11 +71,13 @@ class OKXTrader:
         resp = requests.post(url, headers=headers, data=body)
         return resp.json()
 
+
 # Flask 앱
 app = Flask(__name__)
 
-# ✅ Render에서도 쓸 수 있게 전역에서 trader 생성
+# ✅ 전역에서 trader 먼저 생성 (라우트보다 위)
 trader = OKXTrader()
+
 
 @app.route("/", methods=["GET"])
 def root():
@@ -82,22 +86,31 @@ def root():
         "use": ["/status", "/balance", "/positions", "/webhook"]
     })
 
+
 @app.route("/status", methods=["GET"])
 def status():
+    # market 속성이 market 또는 default_market 둘 다 커버
+    market = getattr(trader, "market", getattr(trader, "default_market", "swap"))
+    simulated_raw = getattr(trader, "simulated", "1")
+    simulated = (str(simulated_raw) == "1") or (simulated_raw is True)
+
     return jsonify({
-        "market": trader.market,
-        "simulated": trader.simulated == "1",
+        "market": market,
+        "simulated": simulated,
         "status": "running",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+        "timestamp": datetime.utcnow().isoformat()
     })
+
 
 @app.route("/balance", methods=["GET"])
 def balance():
     return jsonify(trader.get_balance())
 
+
 @app.route("/positions", methods=["GET"])
 def positions():
     return jsonify(trader.get_positions())
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -118,6 +131,7 @@ def webhook():
 
     result = trader.place_order(instId, side, sz=size)
     return jsonify(result)
+
 
 if __name__ == "__main__":
     print("=== TradingView → OKX 자동매매 시스템 시작 ===")
