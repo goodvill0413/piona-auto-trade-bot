@@ -7,6 +7,8 @@ import hashlib
 import logging
 import requests
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -22,6 +24,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ==============================
+# 유틸: 수량 정규화
+# ==============================
+def normalize_size(amount, lot_size, min_size):
+    """
+    OKX 주문 수량을 lotSz 배수이면서 minSz 이상이 되도록 정규화.
+    반올림(ROUND_HALF_UP)으로 배수에 맞추고, 0 방지.
+    """
+    amt = Decimal(str(amount))
+    lot = Decimal(str(lot_size))
+    minz = Decimal(str(min_size))
+
+    if amt < minz:
+        amt = minz
+
+    multiples = (amt / lot).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+    if multiples <= 0:
+        multiples = Decimal('1')
+
+    normalized = (multiples * lot)
+    return float(normalized)
+
 
 class OKXTrader:
     def __init__(self):
@@ -80,7 +105,7 @@ class OKXTrader:
             return None
 
     def get_instrument_info(self, symbol):
-        """코인의 주문 규칙을 알아내는 함수"""
+        """코인의 주문 규칙(minSz, lotSz 등) 조회"""
         try:
             response = requests.get(
                 f"{self.base_url}/api/v5/public/instruments?instType=SWAP&instId={symbol}",
@@ -134,7 +159,7 @@ class OKXTrader:
             return {"code": "error", "msg": str(e)}
 
     def close_position(self, symbol, side):
-        """포지션 청산"""
+        """포지션 청산 (net/hedge 공통 핸들링)"""
         positions = self.get_positions(symbol)
         logger.info(f"포지션 조회 결과: {positions}")
         if positions.get('code') != '0':
@@ -164,14 +189,8 @@ class OKXTrader:
         lot_size = float(instrument_info['lotSz'])
         min_size = float(instrument_info['minSz'])
 
-        # 수량 검증
-        if amount < min_size:
-            logger.error(f"주문 수량({amount})이 최소 수량({min_size}) 미만입니다")
-            return {"code": "error", "msg": f"주문 수량은 {min_size} 이상이어야 합니다"}
-        if amount % lot_size != 0:
-            adjusted_amount = round(amount / lot_size) * lot_size
-            logger.warning(f"수량({amount})이 lot size({lot_size})의 배수가 아님. 조정된 수량: {adjusted_amount}")
-            amount = adjusted_amount
+        # 수량 정규화(반올림하여 lot 배수 & min 이상)
+        amount = normalize_size(amount, lot_size, min_size)
 
         # 포지션 모드 확인 (net_mode / long_short_mode)
         acc_cfg = self.get_account_config()
@@ -179,8 +198,13 @@ class OKXTrader:
 
         method = "POST"
         path = "/api/v5/trade/order"
+
+        # tdMode 결정: spot은 cash, swap은 cross(데모 안정)
         if td_mode is None:
             td_mode = "cash" if self.default_market == "spot" else self.default_tdmode
+        # 데모(시뮬레이티드)에서는 cross가 가장 호환 잘 됨 → 강제 덮어쓰기
+        if self.simulated == '1' and self.default_market == "swap":
+            td_mode = "cross"
 
         body = {
             "instId": symbol,
@@ -189,7 +213,8 @@ class OKXTrader:
             "ordType": order_type,
             "sz": str(amount)
         }
-        # hedge 모드(long_short_mode)면 posSide 필수
+
+        # hedge 모드(long_short_mode)면 posSide 필수 / net_mode면 생략
         if pos_mode == "long_short_mode":
             body["posSide"] = "long" if side == "buy" else "short"
 
@@ -198,7 +223,7 @@ class OKXTrader:
 
         body_str = json.dumps(body)
         headers = self.sign_request(method, path, body_str)
-        logger.info(f"주문 시도: 심볼={symbol}, 방향={side}, 수량={amount}, 주문타입={order_type}, posMode={pos_mode}, body={body}")
+        logger.info(f"주문 시도: 심볼={symbol}, 방향={side}, 수량={amount}, 주문타입={order_type}, tdMode={td_mode}, posMode={pos_mode}, body={body}")
         try:
             response = requests.post(
                 self.base_url + path,
@@ -214,38 +239,44 @@ class OKXTrader:
             logger.error(f"주문 실행 오류: {e}")
             return {"code": "error", "msg": str(e)}
 
+
 def validate_webhook_token(token):
     """웹훅 토큰 검증"""
     expected_token = os.getenv('WEBHOOK_TOKEN', 'test123')
     return token == expected_token and token != 'change-me'
 
+
 def parse_tradingview_webhook(data):
-    """TradingView 웹훅 데이터 파싱"""
+    """TradingView 웹훅 데이터 파싱 + 심볼/수량 정규화"""
     try:
         if isinstance(data, dict):
             webhook_data = data
         else:
             webhook_data = json.loads(data)
+
         required_fields = ['action', 'symbol']
         for field in required_fields:
             if field not in webhook_data:
                 raise ValueError(f"필수 필드 누락: {field}")
 
-        # 수량 검증 및 보정
-        trader_local = trader  # 전역 trader 사용
-        instrument_info = trader_local.get_instrument_info(webhook_data['symbol'])
+        # 심볼 정규화: 기본 마켓이 swap이면 '-SWAP' 보장
+        sym = webhook_data['symbol']
+        if isinstance(sym, str) and sym and sym.upper() != 'NONE':
+            if trader.default_market == "swap" and not sym.endswith("-SWAP"):
+                sym = sym + "-SWAP"
+
+        # 수량 정규화: lotSz 배수 & minSz 이상
+        quantity = float(webhook_data.get('quantity', 0.001))
+        instrument_info = trader.get_instrument_info(sym)
         if instrument_info:
             lot_size = float(instrument_info['lotSz'])
-            quantity = float(webhook_data.get('quantity', 0.001))
-            if quantity % lot_size != 0:
-                adjusted_quantity = round(quantity / lot_size) * lot_size
-                logger.warning(f"웹훅 수량({quantity})이 lot size({lot_size})의 배수가 아님. 조정된 수량: {adjusted_quantity}")
-                webhook_data['quantity'] = adjusted_quantity
+            min_size = float(instrument_info['minSz'])
+            quantity = normalize_size(quantity, lot_size, min_size)
 
         return {
             'action': webhook_data['action'].lower(),
-            'symbol': webhook_data['symbol'],
-            'quantity': webhook_data.get('quantity', 0.001),
+            'symbol': sym,
+            'quantity': quantity,
             'price': webhook_data.get('price'),
             'order_type': webhook_data.get('order_type', 'market'),
             'message': webhook_data.get('message', ''),
@@ -255,10 +286,12 @@ def parse_tradingview_webhook(data):
         logger.error(f"웹훅 데이터 파싱 오류: {e}")
         return None
 
+
 # -------------------------------
 # 전역에서 trader 초기화 (Gunicorn 임포트 시점에 필요)
 # -------------------------------
 trader = OKXTrader()
+
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -307,11 +340,13 @@ def webhook():
             logger.error(f"주문 실패: {result}")
             return jsonify({
                 "status": "error",
-                "message": f"주문 실패: {result.get('msg', '알 수 없는 오류')}"
+                "message": f"주문 실패: {result.get('msg', '알 수 없는 오류')}",
+                "data": result
             }), 500
     except Exception as e:
         logger.error(f"웹훅 처리 오류: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route('/status', methods=['GET'])
 def status():
@@ -323,6 +358,7 @@ def status():
         "simulated": trader.simulated == '1'
     })
 
+
 @app.route('/positions', methods=['GET'])
 def get_positions():
     """현재 포지션 조회"""
@@ -331,6 +367,7 @@ def get_positions():
         return jsonify(positions)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/balance', methods=['GET'])
 def get_balance():
@@ -349,8 +386,9 @@ def get_balance():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/account_config', methods=['GET'])
-def get_account_config():
+def get_account_config_route():
     """OKX 계정 설정(포지션 모드 등) 조회"""
     try:
         config = trader.get_account_config()
@@ -361,11 +399,12 @@ def get_account_config():
             })
         else:
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "계정 설정 조회 실패"
             }), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/set_leverage', methods=['POST'])
 def set_leverage():
@@ -375,19 +414,19 @@ def set_leverage():
         inst_id = data.get('instId', 'BTC-USDT-SWAP')
         lever = data.get('lever', '10')
         mgn_mode = data.get('mgnMode', 'cross')
-        
+
         method = "POST"
         path = "/api/v5/account/set-leverage"
-        
+
         body = {
             "instId": inst_id,
             "lever": lever,
             "mgnMode": mgn_mode
         }
-        
+
         body_str = json.dumps(body)
         headers = trader.sign_request(method, path, body_str)
-        
+
         response = requests.post(
             trader.base_url + path,
             headers=headers,
@@ -395,9 +434,9 @@ def set_leverage():
             verify=False,
             timeout=10
         )
-        
+
         result = response.json()
-        
+
         if result.get('code') == '0':
             return jsonify({
                 "status": "success",
@@ -407,11 +446,13 @@ def set_leverage():
         else:
             return jsonify({
                 "status": "error",
-                "message": f"레버리지 설정 실패: {result.get('msg', '알 수 없는 오류')}"
+                "message": f"레버리지 설정 실패: {result.get('msg', '알 수 없는 오류')}",
+                "data": result
             }), 500
-            
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/position_mode', methods=['GET', 'POST'])
 def position_mode():
@@ -428,19 +469,19 @@ def position_mode():
                 })
             else:
                 return jsonify({"status": "error", "message": "포지션 모드 조회 실패"}), 500
-                
+
         elif request.method == 'POST':
             # 포지션 모드 변경
             data = request.get_json()
             pos_mode = data.get('posMode', 'net_mode')  # net_mode 또는 long_short_mode
-            
+
             method = "POST"
             path = "/api/v5/account/set-position-mode"
-            
+
             body = {"posMode": pos_mode}
             body_str = json.dumps(body)
             headers = trader.sign_request(method, path, body_str)
-            
+
             response = requests.post(
                 trader.base_url + path,
                 headers=headers,
@@ -448,9 +489,9 @@ def position_mode():
                 verify=False,
                 timeout=10
             )
-            
+
             result = response.json()
-            
+
             if result.get('code') == '0':
                 return jsonify({
                     "status": "success",
@@ -463,9 +504,10 @@ def position_mode():
                     "message": f"포지션 모드 설정 실패: {result.get('msg', '알 수 없는 오류')}",
                     "data": result
                 }), 500
-                
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     # __main__ 블록에서는 전역 trader를 그대로 사용 (재생성 금지)
@@ -477,7 +519,7 @@ if __name__ == '__main__':
     print("상태 확인: http://localhost:5000/status")
     print("=" * 50)
 
-    # 테스트 코드
+    # 개발용 심볼 정보 출력
     info = trader.get_instrument_info("BTC-USDT-SWAP")
     if info:
         print(f"최소 주문 수량: {info['minSz']}")
