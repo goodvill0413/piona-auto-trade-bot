@@ -10,12 +10,12 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import logging
 
+# .env 로드 (Gunicorn 등 WSGI 환경에서 필수)
+load_dotenv()
+
 # SSL 경고 숨기기
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# 환경변수 로드
-load_dotenv()
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,25 +29,165 @@ class OKXTrader:
         self.secret_key = os.getenv('OKX_API_SECRET')
         self.passphrase = os.getenv('OKX_API_PASSPHRASE')
         self.base_url = os.getenv('OKX_BASE_URL', 'https://www.okx.com')
-        self.simulated = os.getenv('OKX_SIMULATED', '1')
+        self.simulated = os.getenv('OKX_SIMULATED', '1')  # '1' 이면 모의모드 헤더 전송
         self.default_tdmode = os.getenv('DEFAULT_TDMODE', 'cross')
         self.default_market = os.getenv('DEFAULT_MARKET', 'swap')
         logger.info(f"OKXTrader 초기화 - 시뮬레이션 모드: {self.simulated}, 마켓: {self.default_market}")
 
     def get_timestamp(self):
-    """
-    Return ISO8601 UTC timestamp with milliseconds for OKX headers.
-    Prefer OKX server time to avoid Invalid OK-ACCESS-TIMESTAMP.
-    """
-    try:
-        r = requests.get(self.base_url + "/api/v5/public/time", timeout=3, verify=False)
-        ts_ms = int(r.json()["data"][0]["ts"])  # OKX server timestamp in milliseconds
-        from datetime import datetime as _dt
-        return _dt.utcfromtimestamp(ts_ms / 1000).isoformat(timespec="milliseconds") + "Z"
-    except Exception:
-        # Fallback: local UTC time in ISO8601 with milliseconds
-        from datetime import datetime as _dt
-        return _dt.utcnow().isoformat(timespec="milliseconds") + "Z"
+        """
+        OKX 서버 시간을 우선 사용하여 ISO8601 UTC(ms) 타임스탬프를 생성.
+        서버 시간 호출 실패 시 로컬 UTC(ms)로 폴백.
+        """
+        try:
+            r = requests.get(self.base_url + "/api/v5/public/time", timeout=3, verify=False)
+            ts_ms = int(r.json()["data"][0]["ts"])  # milliseconds
+            return datetime.utcfromtimestamp(ts_ms / 1000).isoformat(timespec="milliseconds") + "Z"
+        except Exception:
+            return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+    def sign_request(self, method, path, body=""):
+        timestamp = self.get_timestamp()
+        message = timestamp + method + path + (body or "")
+        signature = base64.b64encode(
+            hmac.new(self.secret_key.encode(), message.encode(), hashlib.sha256).digest()
+        ).decode()
+        headers = {
+            'OK-ACCESS-KEY': self.api_key,
+            'OK-ACCESS-SIGN': signature,
+            'OK-ACCESS-TIMESTAMP': timestamp,
+            'OK-ACCESS-PASSPHRASE': self.passphrase,
+            'Content-Type': 'application/json'
+        }
+        # 모의거래 헤더 (시뮬 환경에서만)
+        if self.simulated == '1':
+            headers['x-simulated-trading'] = '1'
+        return headers
+
+    def get_instrument_info(self, symbol):
+        """코인의 주문 규칙을 알아내는 함수"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v5/public/instruments?instType=SWAP&instId={symbol}",
+                verify=False,
+                timeout=5
+            )
+            data = response.json()
+            if data.get('code') == '0' and data.get('data'):
+                logger.info(f"심볼 정보 조회 성공: {symbol}, minSz={data['data'][0]['minSz']}, lotSz={data['data'][0]['lotSz']}")
+                return data['data'][0]
+            logger.error(f"심볼 정보 조회 실패: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"심볼 정보 조회 오류: {e}")
+            return None
+
+    def get_ticker(self, symbol):
+        """현재가 조회"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v5/market/ticker?instId={symbol}",
+                verify=False,
+                timeout=5
+            )
+            data = response.json()
+            if data.get('code') == '0' and data.get('data'):
+                return float(data['data'][0]['last'])
+            logger.error(f"가격 조회 실패: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"가격 조회 오류: {e}")
+            return None
+
+    def get_positions(self, symbol=None):
+        """포지션 조회"""
+        method = "GET"
+        path = "/api/v5/account/positions"
+        if symbol:
+            path += f"?instId={symbol}"
+        headers = self.sign_request(method, path)
+        try:
+            response = requests.get(
+                self.base_url + path,
+                headers=headers,
+                verify=False,
+                timeout=10
+            )
+            return response.json()
+        except Exception as e:
+            logger.error(f"포지션 조회 오류: {e}")
+            return {"code": "error", "msg": str(e)}
+
+    def close_position(self, symbol, side):
+        """포지션 청산"""
+        positions = self.get_positions(symbol)
+        logger.info(f"포지션 조회 결과: {positions}")
+        if positions.get('code') != '0':
+            return positions
+        for pos in positions.get('data', []):
+            if pos.get('instId') == symbol and float(pos.get('pos', 0)) != 0:
+                pos_side = pos['posSide']
+                pos_size = abs(float(pos['pos']))
+                close_side = "sell" if pos_side == "long" else "buy"
+                return self.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    amount=pos_size,
+                    order_type="market",
+                    td_mode=pos.get('mgnMode', self.default_tdmode)
+                )
+        return {"code": "0", "msg": "청산할 포지션이 없습니다"}
+
+    def place_order(self, symbol, side, amount, price=None, order_type="market", td_mode=None):
+        """주문 실행"""
+        # 심볼 정보 조회
+        instrument_info = self.get_instrument_info(symbol)
+        if not instrument_info:
+            logger.error(f"주문 실패: {symbol} 심볼 정보 조회 실패")
+            return {"code": "error", "msg": "심볼 정보 조회 실패"}
+
+        lot_size = float(instrument_info['lotSz'])
+        min_size = float(instrument_info['minSz'])
+
+        # 수량 검증
+        if amount < min_size:
+            logger.error(f"주문 수량({amount})이 최소 수량({min_size}) 미만입니다")
+            return {"code": "error", "msg": f"주문 수량은 {min_size} 이상이어야 합니다"}
+        if amount % lot_size != 0:
+            adjusted_amount = round(amount / lot_size) * lot_size
+            logger.warning(f"수량({amount})이 lot size({lot_size})의 배수가 아님. 조정된 수량: {adjusted_amount}")
+            amount = adjusted_amount
+
+        method = "POST"
+        path = "/api/v5/trade/order"
+        if td_mode is None:
+            td_mode = "cash" if self.default_market == "spot" else self.default_tdmode
+        body = {
+            "instId": symbol,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": order_type,
+            "sz": str(amount)
+        }
+        if price and order_type == "limit":
+            body["px"] = str(price)
+        body_str = json.dumps(body)
+        headers = self.sign_request(method, path, body_str)
+        logger.info(f"주문 시도: 심볼={symbol}, 방향={side}, 수량={amount}, 주문타입={order_type}")
+        try:
+            response = requests.post(
+                self.base_url + path,
+                headers=headers,
+                data=body_str,
+                verify=False,
+                timeout=10
+            )
+            result = response.json()
+            logger.info(f"주문 응답: {response.text}")
+            return result
+        except Exception as e:
+            logger.error(f"주문 실행 오류: {e}")
+            return {"code": "error", "msg": str(e)}
 
 def validate_webhook_token(token):
     """웹훅 토큰 검증"""
@@ -65,10 +205,10 @@ def parse_tradingview_webhook(data):
         for field in required_fields:
             if field not in webhook_data:
                 raise ValueError(f"필수 필드 누락: {field}")
-        
-        # 수량 검증
-        trader = OKXTrader()
-        instrument_info = trader.get_instrument_info(webhook_data['symbol'])
+
+        # 수량 검증 및 보정
+        trader_local = trader  # 전역 trader 사용
+        instrument_info = trader_local.get_instrument_info(webhook_data['symbol'])
         if instrument_info:
             lot_size = float(instrument_info['lotSz'])
             quantity = float(webhook_data.get('quantity', 0.001))
@@ -76,7 +216,7 @@ def parse_tradingview_webhook(data):
                 adjusted_quantity = round(quantity / lot_size) * lot_size
                 logger.warning(f"웹훅 수량({quantity})이 lot size({lot_size})의 배수가 아님. 조정된 수량: {adjusted_quantity}")
                 webhook_data['quantity'] = adjusted_quantity
-        
+
         return {
             'action': webhook_data['action'].lower(),
             'symbol': webhook_data['symbol'],
@@ -89,6 +229,11 @@ def parse_tradingview_webhook(data):
     except Exception as e:
         logger.error(f"웹훅 데이터 파싱 오류: {e}")
         return None
+
+# -------------------------------
+# 전역에서 trader 초기화 (Gunicorn 임포트 시점에 필요)
+# -------------------------------
+trader = OKXTrader()
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -105,12 +250,14 @@ def webhook():
         if not validate_webhook_token(parsed_data['token']):
             logger.warning("유효하지 않은 토큰으로 웹훅 요청")
             return jsonify({"status": "error", "message": "유효하지 않은 토큰"}), 403
+
         action = parsed_data['action']
         symbol = parsed_data['symbol']
         quantity = float(parsed_data['quantity'])
         price = parsed_data.get('price')
         order_type = parsed_data['order_type']
         logger.info(f"실행할 액션: {action}, 심볼: {symbol}, 수량: {quantity}")
+
         if action in ['buy', 'sell']:
             result = trader.place_order(
                 symbol=symbol,
@@ -123,7 +270,8 @@ def webhook():
             result = trader.close_position(symbol, 'both')
         else:
             return jsonify({"status": "error", "message": f"지원하지 않는 액션: {action}"}), 400
-        if result['code'] == '0':
+
+        if result.get('code') == '0':
             logger.info(f"주문 성공: {result}")
             return jsonify({
                 "status": "success",
@@ -177,9 +325,7 @@ def get_balance():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # 먼저 trader를 만들고
-    trader = OKXTrader()
-    
+    # __main__ 블록에서는 전역 trader를 그대로 사용 (재생성 금지)
     print("=== TradingView → OKX 자동매매 시스템 시작 ===")
     print(f"시뮬레이션 모드: {trader.simulated == '1'}")
     print(f"기본 마켓: {trader.default_market}")
@@ -187,13 +333,12 @@ if __name__ == '__main__':
     print("웹훅 URL: http://localhost:5000/webhook")
     print("상태 확인: http://localhost:5000/status")
     print("=" * 50)
-    
+
     # 테스트 코드
-    print("=== 규칙 확인 테스트 ===")
     info = trader.get_instrument_info("BTC-USDT-SWAP")
     if info:
         print(f"최소 주문 수량: {info['minSz']}")
         print(f"단위(Lot Size): {info['lotSz']}")
-    
-    # 웹서버 시작
+
+    # 개발용 로컬 서버
     app.run(host='0.0.0.0', port=5000, debug=True)
