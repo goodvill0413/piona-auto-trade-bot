@@ -216,7 +216,7 @@ class OKXTrader:
 
 def validate_webhook_token(token):
     """웹훅 토큰 검증"""
-    expected_token = os.getenv('WEBHOOK_TOKEN', 'change-me')
+    expected_token = os.getenv('WEBHOOK_TOKEN', 'test123')
     return token == expected_token and token != 'change-me'
 
 def parse_tradingview_webhook(data):
@@ -346,6 +346,70 @@ def get_balance():
             timeout=10
         )
         return jsonify(response.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/account_config', methods=['GET'])
+def get_account_config():
+    """OKX 계정 설정(포지션 모드 등) 조회"""
+    try:
+        config = trader.get_account_config()
+        if config:
+            return jsonify({
+                "status": "success",
+                "data": config
+            })
+        else:
+            return jsonify({
+                "status": "error", 
+                "message": "계정 설정 조회 실패"
+            }), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/set_leverage', methods=['POST'])
+def set_leverage():
+    """레버리지 설정"""
+    try:
+        data = request.get_json()
+        inst_id = data.get('instId', 'BTC-USDT-SWAP')
+        lever = data.get('lever', '10')
+        mgn_mode = data.get('mgnMode', 'cross')
+        
+        method = "POST"
+        path = "/api/v5/account/set-leverage"
+        
+        body = {
+            "instId": inst_id,
+            "lever": lever,
+            "mgnMode": mgn_mode
+        }
+        
+        body_str = json.dumps(body)
+        headers = trader.sign_request(method, path, body_str)
+        
+        response = requests.post(
+            trader.base_url + path,
+            headers=headers,
+            data=body_str,
+            verify=False,
+            timeout=10
+        )
+        
+        result = response.json()
+        
+        if result.get('code') == '0':
+            return jsonify({
+                "status": "success",
+                "message": f"{inst_id} 레버리지 {lever}x 설정 완료",
+                "data": result
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": f"레버리지 설정 실패: {result.get('msg', '알 수 없는 오류')}"
+            }), 500
+            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
