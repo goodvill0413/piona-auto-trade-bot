@@ -9,16 +9,13 @@ def env(name, default=None):
     v = os.getenv(name, default)
     return (v or "").strip()
 
-CLOUDFLARE_HINTS = ("Cloudflare", "Attention Required", "Sorry, you have been blocked")
-
 class OKXTrader:
     def __init__(self):
         self.api_key     = env("OKX_API_KEY")
         self.secret_key  = env("OKX_API_SECRET")
         self.passphrase  = env("OKX_API_PASSPHRASE")
-        # 기본은 www.okx.com, 필요 시 자동 폴백
+        # ✅ 오직 www.okx.com만 사용 (폴백 없음)
         self.base_url    = env("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
-        self.base_url_fb = "https://aws.okx.com"
         self.simulated   = env("OKX_SIMULATED", "1")
         self.td_mode     = env("DEFAULT_TDMODE", "isolated")
         self.market      = env("DEFAULT_MARKET", "swap")
@@ -57,8 +54,13 @@ class OKXTrader:
             h["x-simulated-trading"] = "1"
         return h
 
-    def _call_once(self, base, method, path, body):
-        url = urljoin(base + "/", path.lstrip("/"))
+    def _request(self, method, path, body_obj=None):
+        miss = self._missing_envs()
+        if miss:
+            return {"code":"ENV","msg":f"Missing env: {', '.join(miss)}"}
+
+        body = None if body_obj is None else json.dumps(body_obj)
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
         try:
             resp = self._session.request(
                 method, url,
@@ -69,31 +71,11 @@ class OKXTrader:
             try:
                 data = resp.json()
             except Exception:
-                # Cloudflare 차단 HTML 등
-                text = (resp.text or "")[:2000]
-                return {"code":"HTTP","http_status":resp.status_code,"text":text}
+                data = {"code":"HTTP","http_status": resp.status_code, "text": (resp.text or "")[:2000]}
             data.setdefault("http_status", resp.status_code)
             return data
         except requests.exceptions.RequestException as e:
             return {"code":"EXC","msg":str(e)}
-
-    def _request(self, method, path, body_obj=None):
-        miss = self._missing_envs()
-        if miss:
-            return {"code":"ENV","msg":f"Missing env: {', '.join(miss)}"}
-
-        body = None if body_obj is None else json.dumps(body_obj)
-
-        # 1차: www.okx.com
-        first = self._call_once(self.base_url, method, path, body)
-        if isinstance(first, dict) and first.get("code") == "HTTP":
-            text = first.get("text","")
-            if any(hint in text for hint in CLOUDFLARE_HINTS):
-                # 2차 폴백: aws.okx.com
-                second = self._call_once(self.base_url_fb, method, path, body)
-                second["fallback_used"] = True
-                return second
-        return first
 
     def get_balance(self):
         return self._request("GET", "/api/v5/account/balance")
@@ -128,5 +110,3 @@ def balance():
 def positions():
     t = get_trader()
     return jsonify(t.get_positions()), 200
-
-
