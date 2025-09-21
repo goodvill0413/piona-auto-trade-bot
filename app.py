@@ -4,11 +4,11 @@ import time
 import hmac
 import base64
 import hashlib
+import logging
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import logging
 
 # .env 로드 (Gunicorn 등 WSGI 환경에서 필수)
 load_dotenv()
@@ -59,10 +59,25 @@ class OKXTrader:
             'OK-ACCESS-PASSPHRASE': self.passphrase,
             'Content-Type': 'application/json'
         }
-        # 모의거래 헤더 (시뮬 환경에서만)
         if self.simulated == '1':
             headers['x-simulated-trading'] = '1'
         return headers
+
+    def get_account_config(self):
+        """계정 설정(포지션 모드 등) 조회: posMode = net_mode | long_short_mode"""
+        method = "GET"
+        path = "/api/v5/account/config"
+        headers = self.sign_request(method, path)
+        try:
+            r = requests.get(self.base_url + path, headers=headers, verify=False, timeout=10)
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                return data["data"][0]
+            logger.error(f"계정 설정 조회 실패: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"계정 설정 조회 오류: {e}")
+            return None
 
     def get_instrument_info(self, symbol):
         """코인의 주문 규칙을 알아내는 함수"""
@@ -158,10 +173,15 @@ class OKXTrader:
             logger.warning(f"수량({amount})이 lot size({lot_size})의 배수가 아님. 조정된 수량: {adjusted_amount}")
             amount = adjusted_amount
 
+        # 포지션 모드 확인 (net_mode / long_short_mode)
+        acc_cfg = self.get_account_config()
+        pos_mode = (acc_cfg.get("posMode") if acc_cfg else "net_mode")  # 기본 net_mode 가정
+
         method = "POST"
         path = "/api/v5/trade/order"
         if td_mode is None:
             td_mode = "cash" if self.default_market == "spot" else self.default_tdmode
+
         body = {
             "instId": symbol,
             "tdMode": td_mode,
@@ -169,11 +189,16 @@ class OKXTrader:
             "ordType": order_type,
             "sz": str(amount)
         }
+        # hedge 모드(long_short_mode)면 posSide 필수
+        if pos_mode == "long_short_mode":
+            body["posSide"] = "long" if side == "buy" else "short"
+
         if price and order_type == "limit":
             body["px"] = str(price)
+
         body_str = json.dumps(body)
         headers = self.sign_request(method, path, body_str)
-        logger.info(f"주문 시도: 심볼={symbol}, 방향={side}, 수량={amount}, 주문타입={order_type}")
+        logger.info(f"주문 시도: 심볼={symbol}, 방향={side}, 수량={amount}, 주문타입={order_type}, posMode={pos_mode}, body={body}")
         try:
             response = requests.post(
                 self.base_url + path,
