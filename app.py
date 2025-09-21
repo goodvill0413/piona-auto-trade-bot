@@ -413,6 +413,60 @@ def set_leverage():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/position_mode', methods=['GET', 'POST'])
+def position_mode():
+    """포지션 모드 조회/변경"""
+    try:
+        if request.method == 'GET':
+            # 현재 포지션 모드 조회
+            config = trader.get_account_config()
+            if config:
+                return jsonify({
+                    "status": "success",
+                    "posMode": config.get('posMode', 'net_mode'),
+                    "data": config
+                })
+            else:
+                return jsonify({"status": "error", "message": "포지션 모드 조회 실패"}), 500
+                
+        elif request.method == 'POST':
+            # 포지션 모드 변경
+            data = request.get_json()
+            pos_mode = data.get('posMode', 'net_mode')  # net_mode 또는 long_short_mode
+            
+            method = "POST"
+            path = "/api/v5/account/set-position-mode"
+            
+            body = {"posMode": pos_mode}
+            body_str = json.dumps(body)
+            headers = trader.sign_request(method, path, body_str)
+            
+            response = requests.post(
+                trader.base_url + path,
+                headers=headers,
+                data=body_str,
+                verify=False,
+                timeout=10
+            )
+            
+            result = response.json()
+            
+            if result.get('code') == '0':
+                return jsonify({
+                    "status": "success",
+                    "message": f"포지션 모드 {pos_mode} 설정 완료",
+                    "data": result
+                })
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": f"포지션 모드 설정 실패: {result.get('msg', '알 수 없는 오류')}",
+                    "data": result
+                }), 500
+                
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     # __main__ 블록에서는 전역 trader를 그대로 사용 (재생성 금지)
     print("=== TradingView → OKX 자동매매 시스템 시작 ===")
